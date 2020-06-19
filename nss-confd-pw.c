@@ -29,18 +29,9 @@
 #include <nss.h>
 #include <pwd.h>
 
-#define LL_NONE 0
-#define LL_ERROR 1
-#define LL_DBG 2
+#include "nss-confd.h"
 
-static int log_level = LL_NONE;
-
-struct table {
-	char *filepath;
-	struct stat stat;
-	int fd;
-	char *data;
-};
+int log_level = LL_NONE;
 
 static struct table *tables = 0;
 static size_t n_tables = 0;
@@ -63,19 +54,19 @@ int parse_llong(char *arg, long long *value) {
 		if (endptr) {
 			if ((errno == ERANGE && (val == LLONG_MAX || val == LLONG_MIN)) || (errno != 0 && val == 0)) {
 				if (log_level >= LL_ERROR)
-					fprintf(stderr, "No digits were found\n");
+					ERROR("No digits were found in \"%s\"\n", arg);
 				return -EINVAL;
 			}
 			
 			if (endptr == arg) {
 				if (log_level >= LL_ERROR)
-					fprintf(stderr, "No digits were found\n");
+					ERROR("no digits were found in \"%s\"\n", arg);
 				return -EINVAL;
 			}
 		}
 	} else {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "invalid argument: %s\n", arg);
+			ERROR("invalid argument: %s\n", arg);
 		return -EINVAL;
 	}
 	
@@ -91,6 +82,10 @@ enum nss_status _nss_confd_setpwent(void) {
 	int r;
 	char *passwd_dir;
 	
+	
+	if (tables)
+		return NSS_STATUS_SUCCESS;
+	
 	if (getenv("NSS_CONFD_DEBUG")) {
 		long long value;
 		
@@ -101,7 +96,7 @@ enum nss_status _nss_confd_setpwent(void) {
 	}
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_setpwent()\n");
+		DBG("_nss_confd_setpwent()\n");
 	
 	passwd_dir = getenv("NSS_CONFD_PASSWD_DIR");
 	
@@ -109,12 +104,12 @@ enum nss_status _nss_confd_setpwent(void) {
 		passwd_dir = PASSWD_DIR;
 	
 	if (log_level >= LL_DBG)
-		printf("open dir \"%s\"\n", passwd_dir);
+		DBG("open dir \"%s\"\n", passwd_dir);
 	
 	dp = opendir(passwd_dir);
 	if (!dp) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "opendir(%s) failed: %s\n", passwd_dir, strerror(errno));
+			ERROR("opendir(%s) failed: %s\n", passwd_dir, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
@@ -131,7 +126,7 @@ enum nss_status _nss_confd_setpwent(void) {
 		tables = (struct table *) realloc(tables, sizeof(struct table) * n_tables);
 		if (!tables) {
 			if (log_level >= LL_ERROR)
-				fprintf(stderr, "realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
+				ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
 			
 			return NSS_STATUS_UNAVAIL;
 		}
@@ -172,11 +167,15 @@ enum nss_status _nss_confd_setpwent(void) {
 	r = regcomp(&pw_regex, "^" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN "$", REG_EXTENDED | REG_NEWLINE);
 	if (r) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "regcomp pw_regex failed: %s\n", strerror(r));
+			ERROR("regcomp pw_regex failed: %s\n", strerror(r));
 		
 		// TODO should we free $tables or is a caller expected to call _nss_confd_endpwent()?
 		
 		return NSS_STATUS_UNAVAIL;
+	} else {
+		// although regcomp does not use errno, it might be set afterwards
+		// which is permitted by the errno convention
+		errno = 0;
 	}
 	
 	return NSS_STATUS_SUCCESS;
@@ -187,7 +186,7 @@ enum nss_status _nss_confd_endpwent(void) {
 	size_t i;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_endpwent()\n");
+		DBG("_nss_confd_endpwent()\n");
 	
 	regfree(&pw_regex);
 	
@@ -212,11 +211,15 @@ enum nss_status _nss_confd_endpwent(void) {
 }
 
 // this function is called to iterate through all entries
-enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_t buflen, int *errnop) {
+enum nss_status _nss_confd_getpwent_r_helper(
+	struct passwd *result, char *buffer, size_t buflen, int *errnop,
+	struct table **l_cur_table, char **l_cur_pos
+	)
+{
 	enum nss_status retval;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwent_r()\n");
+		DBG("_nss_confd_getpwent_r()\n");
 	
 	retval = NSS_STATUS_NOTFOUND;
 	
@@ -231,7 +234,7 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 		}
 	}
 	
-	if (!cur_table) {
+	if (!(*l_cur_table)) {
 		*errnop = ENOENT;
 		
 		return NSS_STATUS_NOTFOUND;
@@ -247,7 +250,7 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 		size_t bufidx;
 		
 		
-		if (cur_table >= tables + n_tables) {
+		if ((*l_cur_table) >= tables + n_tables) {
 			*errnop = ENOENT;
 			
 			return NSS_STATUS_NOTFOUND;
@@ -256,14 +259,14 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 		bufpos = buffer;
 		bufidx = 0;
 		
-		r = regexec(&pw_regex, cur_pos, N_GROUPS, rmatch, 0);
+		r = regexec(&pw_regex, (*l_cur_pos), N_GROUPS, rmatch, 0);
 		if (!r) {
 			int i, valid;
 			
 			valid = 1;
 			
 			if (log_level >= LL_DBG)
-				printf("%s: |", cur_table->filepath);
+				DBG("%s: |", (*l_cur_table)->filepath);
 			
 			for (i=1; i < N_GROUPS; i++) {
 				if (rmatch[i].rm_so == (size_t)-1) {
@@ -282,41 +285,19 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 					return NSS_STATUS_TRYAGAIN;
 				}
 				
-				memcpy(bufpos, &cur_pos[rmatch[i].rm_so], slen);
+				memcpy(bufpos, &(*l_cur_pos)[rmatch[i].rm_so], slen);
 				bufpos[slen] = 0;
 				
 				if (log_level >= LL_DBG)
-					printf("%s|", bufpos);
+					DBG("%s|", bufpos);
 				
 				switch (i) {
 					case 1: result->pw_name = bufpos; break;
 					case 2: result->pw_passwd = bufpos; break;
-					case 3: {
-						int r;
-						long long value;
-						
-						r = parse_llong(bufpos, &value);
-						if (r == 0) {
-							result->pw_uid = value;
-						} else {
-							valid = 0;
-						}
-						
-						break;
-					}
-					case 4: {
-						int r;
-						long long value;
-						
-						r = parse_llong(bufpos, &value);
-						if (r == 0) {
-							result->pw_gid = value;
-						} else {
-							valid = 0;
-						}
-						
-						break;
-					}
+					
+					SWITCH_ENTRY(3, pw_uid)
+					SWITCH_ENTRY(4, pw_gid)
+					
 					case 5: result->pw_gecos = bufpos; break;
 					case 6: result->pw_dir = bufpos; break;
 					case 7: result->pw_shell = bufpos; break;
@@ -327,41 +308,41 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 			}
 			
 			if (log_level >= LL_DBG)
-				printf("\n");
+				DBG("\n");
 			
-			cur_pos += rmatch[N_GROUPS-1].rm_eo + 1;
+			(*l_cur_pos) += rmatch[N_GROUPS-1].rm_eo + 1;
 			
-			if (cur_pos >= cur_table->data + cur_table->stat.st_size) {
+			if ((*l_cur_pos) >= (*l_cur_table)->data + (*l_cur_table)->stat.st_size) {
 				if (log_level >= LL_DBG)
-					printf("EOF\n");
+					DBG("EOF\n");
 				
-				cur_table += 1;
-				if (cur_table < tables + n_tables)
-					cur_pos = cur_table->data;
+				(*l_cur_table) += 1;
+				if ((*l_cur_table) < tables + n_tables)
+					(*l_cur_pos) = (*l_cur_table)->data;
 			}
 			
 			if (valid) {
 				retval = NSS_STATUS_SUCCESS;
 			} else {
 				if (log_level >= LL_ERROR)
-					fprintf(stderr, "ignoring invalid entry\n");
+					ERROR("ignoring invalid entry\n");
 				continue;
 			}
 		} else
 		if (r == REG_NOMATCH) {
 			if (log_level >= LL_DBG)
-				printf("EOF\n");
+				DBG("EOF\n");
 			
-			cur_table += 1;
-			if (cur_table < tables + n_tables)
-				cur_pos = cur_table->data;
+			(*l_cur_table) += 1;
+			if ((*l_cur_table) < tables + n_tables)
+				(*l_cur_pos) = (*l_cur_table)->data;
 			
 			continue;
 		} else {
 			regerror(r, &pw_regex, errbuf, sizeof(errbuf));
 			
 			if (log_level >= LL_ERROR)
-				fprintf(stderr, "regexec failed: %s\n", errbuf);
+				ERROR("regexec failed: %s\n", errbuf);
 			
 			*errnop = ENOENT;
 			return NSS_STATUS_UNAVAIL;
@@ -376,14 +357,31 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 	return retval;
 }
 
+// this function is called to iterate through all entries
+enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_t buflen, int *errnop) {
+	return _nss_confd_getpwent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
+}
+
 enum nss_status _nss_confd_getpwuid_r(uid_t uid, struct passwd *result, char *buffer, size_t buflen, int *errnop) {
 	enum nss_status retval;
+	struct table *cur_table;
+	char *cur_pos;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwuid_r()\n");
+		DBG("_nss_confd_getpwuid_r(%u)\n", uid);
+	
+	retval = _nss_confd_setpwent();
+	if (retval != NSS_STATUS_SUCCESS) {
+		*errnop = ENOENT;
+		
+		return retval;
+	}
+	
+	cur_table = tables;
+	cur_pos = cur_table->data;
 	
 	while (1) {
-		retval = _nss_confd_getpwent_r(result, buffer, buflen, errnop);
+		retval = _nss_confd_getpwent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
 		if (retval != NSS_STATUS_SUCCESS)
 			return retval;
 		
@@ -394,12 +392,25 @@ enum nss_status _nss_confd_getpwuid_r(uid_t uid, struct passwd *result, char *bu
 
 enum nss_status _nss_confd_getpwnam_r(const char *name, struct passwd *result, char *buffer, size_t buflen, int *errnop) {
 	enum nss_status retval;
+	struct table *cur_table;
+	char *cur_pos;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwnam_r()\n");
+		DBG("_nss_confd_getpwnam_r(%s)\n", name);
+	
+	retval = _nss_confd_setpwent();
+	if (retval != NSS_STATUS_SUCCESS) {
+		*errnop = ENOENT;
+		
+		return retval;
+	}
+	
+	cur_table = tables;
+	cur_pos = cur_table->data;
 	
 	while (1) {
-		retval = _nss_confd_getpwent_r(result, buffer, buflen, errnop);
+		retval = _nss_confd_getpwent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
+		
 		if (retval != NSS_STATUS_SUCCESS)
 			return retval;
 		

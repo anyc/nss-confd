@@ -14,7 +14,7 @@ function getent_call() {
 	RES="$?"
 
 	if [ "${RES}" != "0" ]; then
-		echo "ERROR getent_call $*" >&2
+		echo "getent_call \"$*\" failed" >&2
 		exit 1
 	fi
 }

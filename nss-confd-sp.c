@@ -29,18 +29,7 @@
 #include <nss.h>
 #include <shadow.h>
 
-#define LL_NONE 0
-#define LL_ERROR 1
-#define LL_DBG 2
-
-static int log_level = LL_NONE;
-
-struct table {
-	char *filepath;
-	struct stat stat;
-	int fd;
-	char *data;
-};
+#include "nss-confd.h"
 
 static struct table *tables = 0;
 static size_t n_tables = 0;
@@ -49,8 +38,6 @@ static char *cur_pos = 0;
 
 static regex_t sp_regex;
 
-// in nss-confd-pw.c
-extern int parse_llong(char *arg, long long *value);
 
 // initialize this module - e.g., open all files
 enum nss_status _nss_confd_setspent(void) {
@@ -58,6 +45,10 @@ enum nss_status _nss_confd_setspent(void) {
 	struct dirent *ep;
 	int r;
 	char *shadow_dir;
+	
+	
+	if (tables)
+		return NSS_STATUS_SUCCESS;
 	
 	if (getenv("NSS_CONFD_DEBUG")) {
 		long long value;
@@ -69,7 +60,7 @@ enum nss_status _nss_confd_setspent(void) {
 	}
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_setspent()\n");
+		DBG("_nss_confd_setspent()\n");
 	
 	shadow_dir = getenv("NSS_CONFD_SHADOW_DIR");
 	
@@ -77,12 +68,12 @@ enum nss_status _nss_confd_setspent(void) {
 		shadow_dir = SHADOW_DIR;
 	
 	if (log_level >= LL_DBG)
-		printf("open dir \"%s\"\n", shadow_dir);
+		DBG("open dir \"%s\"\n", shadow_dir);
 	
 	dp = opendir(shadow_dir);
 	if (!dp) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "opendir(%s) failed: %s\n", shadow_dir, strerror(errno));
+			ERROR("opendir(%s) failed: %s\n", shadow_dir, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
@@ -99,7 +90,7 @@ enum nss_status _nss_confd_setspent(void) {
 		tables = (struct table *) realloc(tables, sizeof(struct table) * n_tables);
 		if (!tables) {
 			if (log_level >= LL_ERROR)
-				fprintf(stderr, "realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
+				ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
 			
 			return NSS_STATUS_UNAVAIL;
 		}
@@ -140,11 +131,15 @@ enum nss_status _nss_confd_setspent(void) {
 	r = regcomp(&sp_regex, "^" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN "$", REG_EXTENDED | REG_NEWLINE);
 	if (r) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "regcomp sp_regex failed: %s\n", strerror(r));
+			ERROR("regcomp sp_regex failed: %s\n", strerror(r));
 		
 		// TODO should we free $tables or is a caller expected to call _nss_confd_endspent()?
 		
 		return NSS_STATUS_UNAVAIL;
+	} else {
+		// although regcomp does not use errno, it might be set afterwards
+		// which is permitted by the errno convention
+		errno = 0;
 	}
 	
 	return NSS_STATUS_SUCCESS;
@@ -155,7 +150,7 @@ enum nss_status _nss_confd_endspent(void) {
 	size_t i;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_endspent()\n");
+		DBG("_nss_confd_endspent()\n");
 	
 	regfree(&sp_regex);
 	
@@ -180,11 +175,15 @@ enum nss_status _nss_confd_endspent(void) {
 }
 
 // this function is called to iterate through all entries
-enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t buflen, int *errnop) {
+enum nss_status _nss_confd_getspent_r_helper(
+	struct spwd *result, char *buffer, size_t buflen, int *errnop,
+	struct table **l_cur_table, char **l_cur_pos
+)
+{
 	enum nss_status retval;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getspent_r()\n");
+		DBG("_nss_confd_getspent_r()\n");
 	
 	retval = NSS_STATUS_NOTFOUND;
 	
@@ -199,7 +198,7 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 		}
 	}
 	
-	if (!cur_table) {
+	if (!(*l_cur_table)) {
 		*errnop = ENOENT;
 		
 		return NSS_STATUS_NOTFOUND;
@@ -215,7 +214,7 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 		size_t bufidx;
 		
 		
-		if (cur_table >= tables + n_tables) {
+		if ((*l_cur_table) >= tables + n_tables) {
 			*errnop = ENOENT;
 			
 			return NSS_STATUS_NOTFOUND;
@@ -224,14 +223,14 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 		bufpos = buffer;
 		bufidx = 0;
 		
-		r = regexec(&sp_regex, cur_pos, N_GROUPS, rmatch, 0);
+		r = regexec(&sp_regex, (*l_cur_pos), N_GROUPS, rmatch, 0);
 		if (!r) {
 			int i, valid;
 			
 			valid = 1;
 			
 			if (log_level >= LL_DBG)
-				printf("%s: |", cur_table->filepath);
+				DBG("%s: |", (*l_cur_table)->filepath);
 			
 			for (i=1; i < N_GROUPS; i++) {
 				if (rmatch[i].rm_so == (size_t)-1) {
@@ -250,30 +249,15 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 					return NSS_STATUS_TRYAGAIN;
 				}
 				
-				memcpy(bufpos, &cur_pos[rmatch[i].rm_so], slen);
+				memcpy(bufpos, &(*l_cur_pos)[rmatch[i].rm_so], slen);
 				bufpos[slen] = 0;
 				
 				if (log_level >= LL_DBG)
-					printf("%s|", bufpos);
+					DBG("%s|", bufpos);
 				
 				switch (i) {
 					case 1: result->sp_namp = bufpos; break;
 					case 2: result->sp_pwdp = bufpos; break;
-					
-					#define SWITCH_ENTRY(i, entry) \
-					case i: { \
-						int r; \
-						long long value; \
-						\
-						r = parse_llong(bufpos, &value); \
-						if (r == 0) { \
-							result->entry = value; \
-						} else { \
-							valid = 0; \
-						} \
-						\
-						break;\
-					}
 					
 					SWITCH_ENTRY(3, sp_lstchg)
 					SWITCH_ENTRY(4, sp_min)
@@ -289,41 +273,41 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 			}
 			
 			if (log_level >= LL_DBG)
-				printf("\n");
+				DBG("\n");
 			
-			cur_pos += rmatch[N_GROUPS-1].rm_eo + 1;
+			(*l_cur_pos) += rmatch[N_GROUPS-1].rm_eo + 1;
 			
-			if (cur_pos >= cur_table->data + cur_table->stat.st_size) {
+			if ((*l_cur_pos) >= (*l_cur_table)->data + (*l_cur_table)->stat.st_size) {
 				if (log_level >= LL_DBG)
-					printf("EOF\n");
+					DBG("EOF\n");
 				
-				cur_table += 1;
-				if (cur_table < tables + n_tables)
-					cur_pos = cur_table->data;
+				(*l_cur_table) += 1;
+				if ((*l_cur_table) < tables + n_tables)
+					(*l_cur_pos) = (*l_cur_table)->data;
 			}
 			
 			if (valid) {
 				retval = NSS_STATUS_SUCCESS;
 			} else {
 				if (log_level >= LL_ERROR)
-					fprintf(stderr, "ignoring invalid entry\n");
+					DBG("ignoring invalid entry\n");
 				continue;
 			}
 		} else
 		if (r == REG_NOMATCH) {
 			if (log_level >= LL_DBG)
-				printf("EOF\n");
+				DBG("EOF\n");
 			
-			cur_table += 1;
-			if (cur_table < tables + n_tables)
-				cur_pos = cur_table->data;
+			(*l_cur_table) += 1;
+			if ((*l_cur_table) < tables + n_tables)
+				(*l_cur_pos) = (*l_cur_table)->data;
 			
 			continue;
 		} else {
 			regerror(r, &sp_regex, errbuf, sizeof(errbuf));
 			
 			if (log_level >= LL_ERROR)
-				fprintf(stderr, "regexec failed: %s\n", errbuf);
+				ERROR("regexec failed: %s\n", errbuf);
 			
 			*errnop = ENOENT;
 			return NSS_STATUS_UNAVAIL;
@@ -338,17 +322,34 @@ enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t 
 	return retval;
 }
 
+// this function is called to iterate through all entries
+enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t buflen, int *errnop) {
+	return _nss_confd_getspent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
+}
+
 enum nss_status _nss_confd_getspnam_r(const char *name, struct spwd *result, char *buffer, size_t buflen, int *errnop) {
 	enum nss_status retval;
+	struct table *cur_table;
+	char *cur_pos;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getspnam_r()\n");
+		DBG("_nss_confd_getspnam_r()\n");
+	
+	retval = _nss_confd_setspent();
+	if (retval != NSS_STATUS_SUCCESS) {
+		*errnop = ENOENT;
+		
+		return retval;
+	}
+	
+	cur_table = tables;
+	cur_pos = cur_table->data;
 	
 	while (1) {
-		retval = _nss_confd_getspent_r(result, buffer, buflen, errnop);
+		retval = _nss_confd_getspent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
+		
 		if (retval != NSS_STATUS_SUCCESS)
 			return retval;
-		
 		if (!strcmp(result->sp_namp, name))
 			return NSS_STATUS_SUCCESS;
 	}
