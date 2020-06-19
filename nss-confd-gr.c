@@ -5,7 +5,7 @@
  * With nss-confd, entries of certain NSS files like /etc/passwd can be
  * split among multiple files in a certain directory (e.g., /etc/passwd.d/).
  * 
- * This file is responsible for passwd queries.
+ * This file is responsible for group queries.
  * 
  * Written 2020 by Mario Kicherer (dev@kicherer.org)
  * 
