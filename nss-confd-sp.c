@@ -1,5 +1,5 @@
 /*
- * nss-confd-pw
+ * nss-confd-sp
  * ------------
  * 
  * With nss-confd, entries of certain NSS files like /etc/passwd can be
@@ -27,7 +27,7 @@
 #include <regex.h>
 
 #include <nss.h>
-#include <pwd.h>
+#include <shadow.h>
 
 #define LL_NONE 0
 #define LL_ERROR 1
@@ -47,49 +47,17 @@ static size_t n_tables = 0;
 static struct table *cur_table = 0;
 static char *cur_pos = 0;
 
-static regex_t pw_regex;
+static regex_t sp_regex;
 
-int parse_llong(char *arg, long long *value) {
-	long long val;
-	char *endptr;
-	
-	if ('0' <= arg[0] && arg[0] <= '9') {
-		if (arg[0] == '0' && arg[1] == 'x') {
-			val = strtoll(arg, &endptr, 16);
-		} else {
-			val = strtoll(arg, &endptr, 10);
-		}
-		
-		if (endptr) {
-			if ((errno == ERANGE && (val == LLONG_MAX || val == LLONG_MIN)) || (errno != 0 && val == 0)) {
-				if (log_level >= LL_ERROR)
-					fprintf(stderr, "No digits were found\n");
-				return -EINVAL;
-			}
-			
-			if (endptr == arg) {
-				if (log_level >= LL_ERROR)
-					fprintf(stderr, "No digits were found\n");
-				return -EINVAL;
-			}
-		}
-	} else {
-		if (log_level >= LL_ERROR)
-			fprintf(stderr, "invalid argument: %s\n", arg);
-		return -EINVAL;
-	}
-	
-	*value = val;
-	
-	return 0;
-}
+// in nss-confd-pw.c
+extern int parse_llong(char *arg, long long *value);
 
 // initialize this module - e.g., open all files
-enum nss_status _nss_confd_setpwent(void) {
+enum nss_status _nss_confd_setspent(void) {
 	DIR *dp;
 	struct dirent *ep;
 	int r;
-	char *passwd_dir;
+	char *shadow_dir;
 	
 	if (getenv("NSS_CONFD_DEBUG")) {
 		long long value;
@@ -101,20 +69,20 @@ enum nss_status _nss_confd_setpwent(void) {
 	}
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_setpwent()\n");
+		printf("_nss_confd_setspent()\n");
 	
-	passwd_dir = getenv("NSS_CONFD_PASSWD_DIR");
+	shadow_dir = getenv("NSS_CONFD_SHADOW_DIR");
 	
-	if (passwd_dir == 0)
-		passwd_dir = PASSWD_DIR;
+	if (shadow_dir == 0)
+		shadow_dir = SHADOW_DIR;
 	
 	if (log_level >= LL_DBG)
-		printf("open dir \"%s\"\n", passwd_dir);
+		printf("open dir \"%s\"\n", shadow_dir);
 	
-	dp = opendir(passwd_dir);
+	dp = opendir(shadow_dir);
 	if (!dp) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "opendir(%s) failed: %s\n", passwd_dir, strerror(errno));
+			fprintf(stderr, "opendir(%s) failed: %s\n", shadow_dir, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
@@ -138,7 +106,7 @@ enum nss_status _nss_confd_setpwent(void) {
 		
 		cur_table = &tables[n_tables-1];
 		
-		asprintf(&cur_table->filepath, "%s/%s", passwd_dir, ep->d_name);
+		asprintf(&cur_table->filepath, "%s/%s", shadow_dir, ep->d_name);
 		
 		cur_table->fd = open(cur_table->filepath, O_RDONLY);
 		
@@ -169,12 +137,12 @@ enum nss_status _nss_confd_setpwent(void) {
 		cur_pos = cur_table->data;
 	
 	#define COLUMN "([^:]*)"
-	r = regcomp(&pw_regex, "^" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN "$", REG_EXTENDED | REG_NEWLINE);
+	r = regcomp(&sp_regex, "^" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN ":" COLUMN "$", REG_EXTENDED | REG_NEWLINE);
 	if (r) {
 		if (log_level >= LL_ERROR)
-			fprintf(stderr, "regcomp pw_regex failed: %s\n", strerror(r));
+			fprintf(stderr, "regcomp sp_regex failed: %s\n", strerror(r));
 		
-		// TODO should we free $tables or is a caller expected to call _nss_confd_endpwent()?
+		// TODO should we free $tables or is a caller expected to call _nss_confd_endspent()?
 		
 		return NSS_STATUS_UNAVAIL;
 	}
@@ -183,13 +151,13 @@ enum nss_status _nss_confd_setpwent(void) {
 }
 
 // shutdown this module
-enum nss_status _nss_confd_endpwent(void) {
+enum nss_status _nss_confd_endspent(void) {
 	size_t i;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_endpwent()\n");
+		printf("_nss_confd_endspent()\n");
 	
-	regfree(&pw_regex);
+	regfree(&sp_regex);
 	
 	for (i=0; i < n_tables; i++) {
 		cur_table = &tables[i];
@@ -212,18 +180,18 @@ enum nss_status _nss_confd_endpwent(void) {
 }
 
 // this function is called to iterate through all entries
-enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_t buflen, int *errnop) {
+enum nss_status _nss_confd_getspent_r(struct spwd *result, char *buffer, size_t buflen, int *errnop) {
 	enum nss_status retval;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwent_r()\n");
+		printf("_nss_confd_getspent_r()\n");
 	
 	retval = NSS_STATUS_NOTFOUND;
 	
 	if (!tables) {
 		enum nss_status r;
 		
-		r = _nss_confd_setpwent();
+		r = _nss_confd_setspent();
 		if (r != NSS_STATUS_SUCCESS) {
 			*errnop = ENOENT;
 			
@@ -240,7 +208,7 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 	while (1) {
 		int r;
 		char errbuf[128];
-		#define N_GROUPS 8
+		#define N_GROUPS 10
 		regmatch_t rmatch[N_GROUPS];
 		size_t slen;
 		char *bufpos;
@@ -256,7 +224,7 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 		bufpos = buffer;
 		bufidx = 0;
 		
-		r = regexec(&pw_regex, cur_pos, N_GROUPS, rmatch, 0);
+		r = regexec(&sp_regex, cur_pos, N_GROUPS, rmatch, 0);
 		if (!r) {
 			int i, valid;
 			
@@ -289,37 +257,31 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 					printf("%s|", bufpos);
 				
 				switch (i) {
-					case 1: result->pw_name = bufpos; break;
-					case 2: result->pw_passwd = bufpos; break;
-					case 3: {
-						int r;
-						long long value;
-						
-						r = parse_llong(bufpos, &value);
-						if (r == 0) {
-							result->pw_uid = value;
-						} else {
-							valid = 0;
-						}
-						
-						break;
+					case 1: result->sp_namp = bufpos; break;
+					case 2: result->sp_pwdp = bufpos; break;
+					
+					#define SWITCH_ENTRY(i, entry) \
+					case i: { \
+						int r; \
+						long long value; \
+						\
+						r = parse_llong(bufpos, &value); \
+						if (r == 0) { \
+							result->entry = value; \
+						} else { \
+							valid = 0; \
+						} \
+						\
+						break;\
 					}
-					case 4: {
-						int r;
-						long long value;
-						
-						r = parse_llong(bufpos, &value);
-						if (r == 0) {
-							result->pw_gid = value;
-						} else {
-							valid = 0;
-						}
-						
-						break;
-					}
-					case 5: result->pw_gecos = bufpos; break;
-					case 6: result->pw_dir = bufpos; break;
-					case 7: result->pw_shell = bufpos; break;
+					
+					SWITCH_ENTRY(3, sp_lstchg)
+					SWITCH_ENTRY(4, sp_min)
+					SWITCH_ENTRY(5, sp_max)
+					SWITCH_ENTRY(6, sp_warn)
+					SWITCH_ENTRY(7, sp_inact)
+					SWITCH_ENTRY(8, sp_expire)
+					SWITCH_ENTRY(9, sp_flag)
 				}
 				
 				bufpos += slen + 1;
@@ -358,7 +320,7 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 			
 			continue;
 		} else {
-			regerror(r, &pw_regex, errbuf, sizeof(errbuf));
+			regerror(r, &sp_regex, errbuf, sizeof(errbuf));
 			
 			if (log_level >= LL_ERROR)
 				fprintf(stderr, "regexec failed: %s\n", errbuf);
@@ -376,34 +338,18 @@ enum nss_status _nss_confd_getpwent_r(struct passwd *result, char *buffer, size_
 	return retval;
 }
 
-enum nss_status _nss_confd_getpwuid_r(uid_t uid, struct passwd *result, char *buffer, size_t buflen, int *errnop) {
+enum nss_status _nss_confd_getspnam_r(const char *name, struct spwd *result, char *buffer, size_t buflen, int *errnop) {
 	enum nss_status retval;
 	
 	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwuid_r()\n");
+		printf("_nss_confd_getspnam_r()\n");
 	
 	while (1) {
-		retval = _nss_confd_getpwent_r(result, buffer, buflen, errnop);
+		retval = _nss_confd_getspent_r(result, buffer, buflen, errnop);
 		if (retval != NSS_STATUS_SUCCESS)
 			return retval;
 		
-		if (result->pw_uid == uid)
-			return NSS_STATUS_SUCCESS;
-	}
-}
-
-enum nss_status _nss_confd_getpwnam_r(const char *name, struct passwd *result, char *buffer, size_t buflen, int *errnop) {
-	enum nss_status retval;
-	
-	if (log_level >= LL_DBG)
-		printf("_nss_confd_getpwnam_r()\n");
-	
-	while (1) {
-		retval = _nss_confd_getpwent_r(result, buffer, buflen, errnop);
-		if (retval != NSS_STATUS_SUCCESS)
-			return retval;
-		
-		if (!strcmp(result->pw_name, name))
+		if (!strcmp(result->sp_namp, name))
 			return NSS_STATUS_SUCCESS;
 	}
 }

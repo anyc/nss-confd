@@ -1,8 +1,10 @@
 
 SO_VER=2
-OBJS=nss-confd-pw.o
+OBJS=nss-confd-pw.o nss-confd-gr.o nss-confd-sp.o
 
-CFLAGS+=-fPIC -DPASSWD_DIR=\"/etc/passwd.d\"
+prefix?=/usr/local
+sysconf_dir?=$(prefix)/etc
+CFLAGS+=-fPIC -DPASSWD_DIR=\"$(sysconf_dir)/passwd.d\" -DGROUP_DIR=\"$(sysconf_dir)/group.d\"  -DSHADOW_DIR=\"$(sysconf_dir)/shadow.d\"
 
 CFLAGS+=-Wall -g
 
