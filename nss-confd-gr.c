@@ -47,10 +47,10 @@ static regex_t gm_regex;
 
 // initialize this module - e.g., open all files
 enum nss_status _nss_confd_setgrent(void) {
-	DIR *dp;
 	struct dirent *ep;
-	int r;
+	int i, r, n_entries, abort;
 	char *dirpath;
+	struct dirent **namelist;
 	
 	
 	if (tables)
@@ -76,18 +76,17 @@ enum nss_status _nss_confd_setgrent(void) {
 	if (log_level >= LL_DBG)
 		DBG("open dir \"%s\"\n", dirpath);
 	
-	dp = opendir(dirpath);
-	if (!dp) {
+	n_entries = scandir(dirpath, &namelist, 0, alphasort);
+	if (n_entries < 0) {
 		if (log_level >= LL_ERROR)
-			ERROR("opendir(%s) failed: %s\n", dirpath, strerror(errno));
+			ERROR("scandir(%s) failed: %s\n", dirpath, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
 	
-	while (1) {
-		ep = readdir(dp);
-		if (!ep)
-			break;
+	abort = 0;
+	for (i = 0; i < n_entries; i++) {
+		ep = namelist[i];
 		
 		if (ep->d_type != DT_REG)
 			continue;
@@ -105,7 +104,8 @@ enum nss_status _nss_confd_setgrent(void) {
 					if (log_level >= LL_ERROR)
 						ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_split_members, strerror(errno));
 					
-					return NSS_STATUS_UNAVAIL;
+					abort = 1;
+					break;
 				}
 				
 				cur_table = &split_members[n_split_members-1];
@@ -144,7 +144,8 @@ enum nss_status _nss_confd_setgrent(void) {
 			if (log_level >= LL_ERROR)
 				ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
 			
-			return NSS_STATUS_UNAVAIL;
+			abort = 1;
+			break;
 		}
 		
 		cur_table = &tables[n_tables-1];
@@ -173,7 +174,13 @@ enum nss_status _nss_confd_setgrent(void) {
 		}
 	}
 	
-	closedir(dp);
+	for (i = 0; i < n_entries; i++) {
+		free(namelist[i]);
+	}
+	free(namelist);
+	
+	if (abort)
+		return NSS_STATUS_UNAVAIL;
 	
 	cur_table = tables;
 	if (cur_table)

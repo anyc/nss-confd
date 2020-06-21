@@ -77,10 +77,10 @@ int parse_llong(char *arg, long long *value) {
 
 // initialize this module - e.g., open all files
 enum nss_status _nss_confd_setpwent(void) {
-	DIR *dp;
 	struct dirent *ep;
-	int r;
-	char *passwd_dir;
+	int i, r, n_entries, abort;
+	char *dirpath;
+	struct dirent **namelist;
 	
 	
 	if (tables)
@@ -98,26 +98,25 @@ enum nss_status _nss_confd_setpwent(void) {
 	if (log_level >= LL_DBG)
 		DBG("_nss_confd_setpwent()\n");
 	
-	passwd_dir = getenv("NSS_CONFD_PASSWD_DIR");
+	dirpath = getenv("NSS_CONFD_PASSWD_DIR");
 	
-	if (passwd_dir == 0)
-		passwd_dir = PASSWD_DIR;
+	if (dirpath == 0)
+		dirpath = PASSWD_DIR;
 	
 	if (log_level >= LL_DBG)
-		DBG("open dir \"%s\"\n", passwd_dir);
+		DBG("open dir \"%s\"\n", dirpath);
 	
-	dp = opendir(passwd_dir);
-	if (!dp) {
+	n_entries = scandir(dirpath, &namelist, 0, alphasort);
+	if (n_entries < 0) {
 		if (log_level >= LL_ERROR)
-			ERROR("opendir(%s) failed: %s\n", passwd_dir, strerror(errno));
+			ERROR("scandir(%s) failed: %s\n", dirpath, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
 	
-	while (1) {
-		ep = readdir(dp);
-		if (!ep)
-			break;
+	abort = 0;
+	for (i = 0; i < n_entries; i++) {
+		ep = namelist[i];
 		
 		if (ep->d_type != DT_REG && ep->d_type != DT_LNK)
 			continue;
@@ -128,12 +127,13 @@ enum nss_status _nss_confd_setpwent(void) {
 			if (log_level >= LL_ERROR)
 				ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_tables, strerror(errno));
 			
-			return NSS_STATUS_UNAVAIL;
+			abort = 1;
+			break;
 		}
 		
 		cur_table = &tables[n_tables-1];
 		
-		asprintf(&cur_table->filepath, "%s/%s", passwd_dir, ep->d_name);
+		asprintf(&cur_table->filepath, "%s/%s", dirpath, ep->d_name);
 		
 		cur_table->fd = open(cur_table->filepath, O_RDONLY);
 		
@@ -157,7 +157,13 @@ enum nss_status _nss_confd_setpwent(void) {
 		}
 	}
 	
-	closedir(dp);
+	for (i = 0; i < n_entries; i++) {
+		free(namelist[i]);
+	}
+	free(namelist);
+	
+	if (abort)
+		return NSS_STATUS_UNAVAIL;
 	
 	cur_table = tables;
 	if (cur_table)
