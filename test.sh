@@ -2,6 +2,8 @@
 
 [ -e libnss_confd.so.2 ] || { echo "libnss_confd.so.2 not found"; exit 1; }
 
+TEST_SPLIT_MEMBERS="$1"
+
 function getent_call() {
 #	VALGRIND="valgrind --leak-check=full"
 
@@ -42,6 +44,10 @@ getent_test group b1 "b1:b2:2:user1"
 getent_test group c1 "c1:c2:3:user1,user2"
 getent_test group d1 "d1:d2:4:user1,user2,"
 getent_test group e1 "e1:e2:5:user1,user2,user3"
+if [ "${TEST_SPLIT_MEMBERS}" == "1" ]; then
+	getent_test group f1 "f1:f2:6:user4,user5"
+	getent_test group g1 "g1:g2:7:user0,user5,user4"
+fi
 
 getent_test group x1 ""
 

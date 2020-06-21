@@ -38,12 +38,19 @@ static char *cur_pos = 0;
 
 static regex_t gr_regex;
 
+#ifdef NSS_CONFD_WITH_SPLIT_MEMBERS
+static struct table *split_members = 0;
+static size_t n_split_members = 0;
+
+static regex_t gm_regex;
+#endif
+
 // initialize this module - e.g., open all files
 enum nss_status _nss_confd_setgrent(void) {
 	DIR *dp;
 	struct dirent *ep;
 	int r;
-	char *group_dir;
+	char *dirpath;
 	
 	
 	if (tables)
@@ -61,18 +68,18 @@ enum nss_status _nss_confd_setgrent(void) {
 	if (log_level >= LL_DBG)
 		DBG("_nss_confd_setgrent()\n");
 	
-	group_dir = getenv("NSS_CONFD_GROUP_DIR");
+	dirpath = getenv("NSS_CONFD_GROUP_DIR");
 	
-	if (group_dir == 0)
-		group_dir = GROUP_DIR;
+	if (dirpath == 0)
+		dirpath = GROUP_DIR;
 	
 	if (log_level >= LL_DBG)
-		DBG("open dir \"%s\"\n", group_dir);
+		DBG("open dir \"%s\"\n", dirpath);
 	
-	dp = opendir(group_dir);
+	dp = opendir(dirpath);
 	if (!dp) {
 		if (log_level >= LL_ERROR)
-			ERROR("opendir(%s) failed: %s\n", group_dir, strerror(errno));
+			ERROR("opendir(%s) failed: %s\n", dirpath, strerror(errno));
 		
 		return NSS_STATUS_UNAVAIL;
 	}
@@ -82,8 +89,54 @@ enum nss_status _nss_confd_setgrent(void) {
 		if (!ep)
 			break;
 		
-		if (ep->d_type != DT_REG && ep->d_type != DT_LNK)
+		if (ep->d_type != DT_REG)
 			continue;
+		
+		#ifdef NSS_CONFD_WITH_SPLIT_MEMBERS
+		size_t slen;
+		
+		slen = strlen(ep->d_name);
+		
+		if (slen > 11) {
+			if (!strcmp(&ep->d_name[slen - 11], ".membership")) {
+				n_split_members += 1;
+				split_members = (struct table *) realloc(split_members, sizeof(struct table) * n_split_members);
+				if (!split_members) {
+					if (log_level >= LL_ERROR)
+						ERROR("realloc(%zu) failed: %s\n", sizeof(struct table) * n_split_members, strerror(errno));
+					
+					return NSS_STATUS_UNAVAIL;
+				}
+				
+				cur_table = &split_members[n_split_members-1];
+				
+				asprintf(&cur_table->filepath, "%s/%s", dirpath, ep->d_name);
+				
+				cur_table->fd = open(cur_table->filepath, O_RDONLY);
+				
+				if (fstat(cur_table->fd, &cur_table->stat) == -1) {
+					close(cur_table->fd);
+					free(cur_table->filepath);
+					
+					n_split_members -= 1;
+					
+					continue;
+				}
+				
+				cur_table->data = mmap(0, cur_table->stat.st_size, PROT_READ, MAP_SHARED, cur_table->fd, 0);
+				if (cur_table->data == MAP_FAILED) {
+					close(cur_table->fd);
+					free(cur_table->filepath);
+					
+					n_split_members -= 1;
+					
+					continue;
+				}
+				
+				continue;
+			}
+		}
+		#endif
 		
 		n_tables += 1;
 		tables = (struct table *) realloc(tables, sizeof(struct table) * n_tables);
@@ -96,7 +149,7 @@ enum nss_status _nss_confd_setgrent(void) {
 		
 		cur_table = &tables[n_tables-1];
 		
-		asprintf(&cur_table->filepath, "%s/%s", group_dir, ep->d_name);
+		asprintf(&cur_table->filepath, "%s/%s", dirpath, ep->d_name);
 		
 		cur_table->fd = open(cur_table->filepath, O_RDONLY);
 		
@@ -141,6 +194,22 @@ enum nss_status _nss_confd_setgrent(void) {
 		errno = 0;
 	}
 	
+	#ifdef NSS_CONFD_WITH_SPLIT_MEMBERS
+	r = regcomp(&gm_regex, "^" COLUMN ":" COLUMN "$", REG_EXTENDED | REG_NEWLINE);
+	if (r) {
+		if (log_level >= LL_ERROR)
+			ERROR("regcomp gr_regex failed: %s\n", strerror(r));
+		
+		// TODO should we free $tables or is a caller expected to call _nss_confd_endgrent()?
+		
+		return NSS_STATUS_UNAVAIL;
+	} else {
+		// although regcomp does not use errno, it might be set afterwards
+		// which is permitted by the errno convention
+		errno = 0;
+	}
+	#endif
+	
 	return NSS_STATUS_SUCCESS;
 }
 
@@ -172,6 +241,115 @@ enum nss_status _nss_confd_endgrent(void) {
 	
 	return NSS_STATUS_SUCCESS;
 }
+
+#ifdef NSS_CONFD_WITH_SPLIT_MEMBERS
+// this function parses the split_members files and appends the members of the given group to the buffer
+int find_members(char *gr_name, char *buffer, char *bufpos, size_t buflen, size_t *new_slen) {
+	struct table *cur_sm_table;
+	char *cur_sm_pos;
+	
+	
+	*new_slen = 0;
+	
+	cur_sm_table = split_members;
+	if (split_members)
+		cur_sm_pos = split_members->data;
+	else
+		return 0;
+	
+	while (1) {
+		int r;
+		char errbuf[128];
+		#define N_MEMBERS_GROUPS 3
+		regmatch_t rmatch[N_MEMBERS_GROUPS];
+		size_t slen;
+		
+		
+		if (cur_sm_table >= split_members + n_split_members) {
+			break;
+		}
+		
+		r = regexec(&gm_regex, cur_sm_pos, N_MEMBERS_GROUPS, rmatch, 0);
+		if (!r) {
+			int i, skip;
+			
+			skip = 1;
+			
+			if (log_level >= LL_DBG)
+				DBG("%s: |", cur_sm_table->filepath);
+			
+			for (i=1; i < N_MEMBERS_GROUPS; i++) {
+				if (rmatch[i].rm_so == (size_t)-1) {
+					// TODO can this still happen?
+					
+					break;
+				}
+				
+				slen = rmatch[i].rm_eo - rmatch[i].rm_so;
+				
+				if ((bufpos - buffer) + slen + 1 >= buflen) {
+					return NSS_STATUS_TRYAGAIN;
+				}
+				
+				memcpy(bufpos, &cur_sm_pos[rmatch[i].rm_so], slen);
+				bufpos[slen] = 0;
+				
+				if (log_level >= LL_DBG)
+					DBG("%s|", bufpos);
+				
+				switch (i) {
+					case 1:
+						if (!strcmp(gr_name, bufpos))
+							skip = 0;
+						
+						break;
+					case 2: {
+						// add additional ',', the calling function will remove the last one later
+						bufpos[slen] = ',';
+						bufpos[slen+1] = 0;
+						bufpos += slen + 1;
+						*new_slen += slen + 1;
+					}
+				}
+				
+				if (skip)
+					break;
+			}
+			
+			if (log_level >= LL_DBG)
+				DBG("\n");
+			
+			cur_sm_pos += rmatch[N_MEMBERS_GROUPS-1].rm_eo + 1;
+			
+			if (cur_sm_pos >= cur_sm_table->data + cur_sm_table->stat.st_size) {
+				if (log_level >= LL_DBG)
+					DBG("EOF\n");
+				
+				cur_sm_table += 1;
+				if (cur_sm_table < split_members + n_split_members)
+					cur_sm_pos = cur_sm_table->data;
+			}
+		} else
+		if (r == REG_NOMATCH) {
+			if (log_level >= LL_DBG)
+				DBG("EOF\n");
+			
+			cur_sm_table += 1;
+			if (cur_sm_table < split_members + n_split_members)
+				cur_sm_pos = cur_sm_table->data;
+		} else {
+			regerror(r, &gr_regex, errbuf, sizeof(errbuf));
+			
+			if (log_level >= LL_ERROR)
+				ERROR("regexec failed: %s\n", errbuf);
+			
+			return -1;
+		}
+	}
+	
+	return 0;
+}
+#endif
 
 // this function is called to iterate through all entries
 enum nss_status _nss_confd_getgrent_r_helper(
@@ -210,7 +388,6 @@ enum nss_status _nss_confd_getgrent_r_helper(
 		regmatch_t rmatch[N_GROUPS];
 		size_t slen;
 		char *bufpos;
-		size_t bufidx;
 		
 		
 		if ((*l_cur_table) >= tables + n_tables) {
@@ -220,7 +397,6 @@ enum nss_status _nss_confd_getgrent_r_helper(
 		}
 		
 		bufpos = buffer;
-		bufidx = 0;
 		
 		r = regexec(&gr_regex, (*l_cur_pos), N_GROUPS, rmatch, 0);
 		if (!r) {
@@ -242,7 +418,7 @@ enum nss_status _nss_confd_getgrent_r_helper(
 				
 				slen = rmatch[i].rm_eo - rmatch[i].rm_so;
 				
-				if (bufidx + slen + 1 >= buflen) {
+				if ((bufpos - buffer) + slen + 1 >= buflen) {
 					*errnop = ERANGE;
 					
 					return NSS_STATUS_TRYAGAIN;
@@ -261,12 +437,49 @@ enum nss_status _nss_confd_getgrent_r_helper(
 					SWITCH_ENTRY(3, gr_gid)
 					
 					case 4: {
-// 						result->gr_mem = bufpos; break;
-						
 						size_t j, k, member_count, last_valid;
 						
+						/*
+						 * the member list is already stored in the buffer, we just
+						 * have to replace the "," with zeroes to generate valid strings
+						 * and to store pointers into the string list
+						 */
+						
+						#ifdef NSS_CONFD_WITH_SPLIT_MEMBERS
+						size_t new_slen;
+						char *start_pos;
+						
+						start_pos = bufpos + slen;
+						// if there is already a member, leave space for a ','
+						if (slen > 0)
+							start_pos += 1;
+						
+						// get the list of additional members and append it to the member list in $buffer
+						r = find_members(result->gr_name, buffer, start_pos, buflen, &new_slen);
+						if (r == 0) {
+							if (new_slen > 0) {
+								// replace null termination with ','
+								if (slen > 0)
+									bufpos[slen] = ',';
+								
+								// set new null terminator
+								start_pos[new_slen -1] = 0;
+								
+								slen += new_slen;
+							}
+						} else {
+							if (r == NSS_STATUS_TRYAGAIN) {
+								*errnop = ERANGE;
+								
+								return NSS_STATUS_TRYAGAIN;
+							}
+						}
+						#endif
+						
+						// get the number of ',' = number of members - 1
+						last_valid = ( slen > 0 );
 						member_count = 0;
-						for (j=0; j < slen; j ++) {
+						for (j=0; j < slen; j++) {
 							if (bufpos[j] == ',') {
 								member_count += 1;
 								if (j < slen)
@@ -278,33 +491,35 @@ enum nss_status _nss_confd_getgrent_r_helper(
 						if (last_valid)
 							member_count += 1;
 						
-						result->gr_mem = (char **) bufpos + slen + 1;
+						// "allocate" the string list
+						result->gr_mem = (char **) (bufpos + slen + 1);
 						
+						// fill the string list with pointers and replace ',' with 0
+						k = 0;
 						if (member_count > 0) {
-							result->gr_mem[0] = bufpos;
-							k = 1;
-							for (j=0; j < slen; j ++) {
+							result->gr_mem[k] = bufpos;
+							k += 1;
+							
+							for (j=0; j < slen; j++) {
 								if (bufpos[j] == ',') {
 									result->gr_mem[k] = &bufpos[j+1];
-									bufpos[j] = 0;
 									k += 1;
+									
+									bufpos[j] = 0;
 								}
 							}
-							result->gr_mem[k] = 0;
-						} else {
-							result->gr_mem[0] = 0;
 						}
 						
+						result->gr_mem[k] = 0;
 						member_count += 1;
+						
 						bufpos += member_count * sizeof(char*);
-						bufidx += member_count * sizeof(char*);
 						
 						break;
 					}
 				}
 				
 				bufpos += slen + 1;
-				bufidx += slen + 1;
 			}
 			
 			if (log_level >= LL_DBG)
@@ -378,7 +593,13 @@ enum nss_status _nss_confd_getgrgid_r(gid_t gid, struct group *result, char *buf
 	}
 	
 	cur_table = tables;
-	cur_pos = cur_table->data;
+	if (tables) {
+		cur_pos = cur_table->data;
+	} else {
+		*errnop = ENOENT;
+		
+		return NSS_STATUS_NOTFOUND;
+	}
 	
 	while (1) {
 		retval = _nss_confd_getgrent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
@@ -406,7 +627,13 @@ enum nss_status _nss_confd_getgrnam_r(const char *name, struct group *result, ch
 	}
 	
 	cur_table = tables;
-	cur_pos = cur_table->data;
+	if (tables) {
+		cur_pos = cur_table->data;
+	} else {
+		*errnop = ENOENT;
+		
+		return NSS_STATUS_NOTFOUND;
+	}
 	
 	while (1) {
 		retval = _nss_confd_getgrent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);

@@ -378,7 +378,13 @@ enum nss_status _nss_confd_getpwuid_r(uid_t uid, struct passwd *result, char *bu
 	}
 	
 	cur_table = tables;
-	cur_pos = cur_table->data;
+	if (tables) {
+		cur_pos = cur_table->data;
+	} else {
+		*errnop = ENOENT;
+		
+		return NSS_STATUS_NOTFOUND;
+	}
 	
 	while (1) {
 		retval = _nss_confd_getpwent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);
@@ -406,7 +412,13 @@ enum nss_status _nss_confd_getpwnam_r(const char *name, struct passwd *result, c
 	}
 	
 	cur_table = tables;
-	cur_pos = cur_table->data;
+	if (tables) {
+		cur_pos = cur_table->data;
+	} else {
+		*errnop = ENOENT;
+		
+		return NSS_STATUS_NOTFOUND;
+	}
 	
 	while (1) {
 		retval = _nss_confd_getpwent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);

@@ -343,7 +343,13 @@ enum nss_status _nss_confd_getspnam_r(const char *name, struct spwd *result, cha
 	}
 	
 	cur_table = tables;
-	cur_pos = cur_table->data;
+	if (tables) {
+		cur_pos = cur_table->data;
+	} else {
+		*errnop = ENOENT;
+		
+		return NSS_STATUS_NOTFOUND;
+	}
 	
 	while (1) {
 		retval = _nss_confd_getspent_r_helper(result, buffer, buflen, errnop, &cur_table, &cur_pos);

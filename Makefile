@@ -9,12 +9,16 @@ CFLAGS+=-fPIC -DPASSWD_DIR=\"$(sysconf_dir)/passwd.d\" -DGROUP_DIR=\"$(sysconf_d
 
 CFLAGS+=-Wall -g
 
+ifeq ($(WITH_SPLIT_MEMBERS),1)
+CFLAGS+=-DNSS_CONFD_WITH_SPLIT_MEMBERS=1
+endif
+
 INSTALL?=install
 
-all: nss-confd
+all: libnss_confd.so.$(SO_VER)
 
-nss-confd: $(OBJS)
-	$(CC) -shared -o libnss_confd.so.$(SO_VER) -Wl,-soname,libnss_confd.so.$(SO_VER) $(OBJS) $(LDFLAGS)
+libnss_confd.so.$(SO_VER): $(OBJS)
+	$(CC) -shared -o $@ -Wl,-soname,$@ $(OBJS) $(LDFLAGS)
 
 install:
 	$(INSTALL) -m 755 -d $(DESTDIR)$(sysconf_dir)/passwd.d

@@ -3,8 +3,8 @@
 #define LL_ERROR 1
 #define LL_DBG 2
 
-#define DBG(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
-#define ERROR(fmt, ...) do { fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+#define DBG(fmt, ...) do { if (log_level >= LL_DBG) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+#define ERROR(fmt, ...) do { if (log_level >= LL_ERROR) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 
 extern int log_level;
 
